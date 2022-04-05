@@ -1,2 +1,2 @@
 # go-runpe
-Execute a PE in the address space of another PE aka process hollowing 
+Modified version from https://github.com/abdullah2993/go-runpe and https://github.com/nodauf/go-runpe/tree/patch-1
